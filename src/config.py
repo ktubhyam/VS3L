@@ -221,3 +221,31 @@ class SpectralFMConfig:
     @property
     def total_latent_dim(self) -> int:
         return self.vib.z_chem_dim + self.vib.z_inst_dim
+
+
+def get_light_config() -> SpectralFMConfig:
+    """Get a lightweight configuration for fast CPU testing."""
+    cfg = SpectralFMConfig()
+
+    # Smaller model dimensions
+    cfg.mamba.d_model = 64
+    cfg.mamba.d_state = 8
+    cfg.mamba.n_layers = 2
+    cfg.mamba.expand = 1
+
+    cfg.transformer.d_model = 64
+    cfg.transformer.n_heads = 4
+    cfg.transformer.n_layers = 1
+    cfg.transformer.d_ff = 128
+
+    cfg.moe.n_experts = 2
+    cfg.moe.d_expert = 128
+
+    cfg.vib.z_chem_dim = 32
+    cfg.vib.z_inst_dim = 16
+
+    cfg.fno.width = 16
+    cfg.fno.modes = 8
+    cfg.fno.n_layers = 2
+
+    return cfg
