@@ -282,26 +282,36 @@ def run_baseline_comparison(
     results["Target_Direct"]["n_components"] = pls_upper.optimal_n_components
 
     # 3. PDS + PLS
+    # Learn target → source mapping using transfer standards, then correct target test data
+    # PLS is trained on source, so we transform target to source space
     pds = PDS(window_size=11)  # ±5 wavelengths
-    X_source_test_corrected = pds.fit_transform(X_target_train, X_source_train, X_source_test)
+    pds.fit(X_source_train, X_target_train)  # primary=source, secondary=target
+    X_target_test_corrected = pds.transform(X_target_test)
     pls_pds = PLSCalibration(n_components=pls_components)
-    y_pred = pls_pds.fit_predict(X_source_train, y_train, X_source_test_corrected)
+    pls_pds.fit(X_source_train, y_train)
+    y_pred = pls_pds.predict(X_target_test_corrected)
     results["PDS"] = compute_metrics(y_test, y_pred)
     results["PDS"]["n_components"] = pls_pds.optimal_n_components
 
     # 4. SBC + PLS
+    # Same approach: transform target to source space
     sbc = SBC()
-    X_source_test_corrected = sbc.fit_transform(X_target_train, X_source_train, X_source_test)
+    sbc.fit(X_source_train, X_target_train)  # primary=source, secondary=target
+    X_target_test_corrected = sbc.transform(X_target_test)
     pls_sbc = PLSCalibration(n_components=pls_components)
-    y_pred = pls_sbc.fit_predict(X_source_train, y_train, X_source_test_corrected)
+    pls_sbc.fit(X_source_train, y_train)
+    y_pred = pls_sbc.predict(X_target_test_corrected)
     results["SBC"] = compute_metrics(y_test, y_pred)
     results["SBC"]["n_components"] = pls_sbc.optimal_n_components
 
     # 5. DS + PLS
+    # Same approach: transform target to source space
     ds = DS(regularization=1e-2)
-    X_source_test_corrected = ds.fit_transform(X_target_train, X_source_train, X_source_test)
+    ds.fit(X_source_train, X_target_train)  # primary=source, secondary=target
+    X_target_test_corrected = ds.transform(X_target_test)
     pls_ds = PLSCalibration(n_components=pls_components)
-    y_pred = pls_ds.fit_predict(X_source_train, y_train, X_source_test_corrected)
+    pls_ds.fit(X_source_train, y_train)
+    y_pred = pls_ds.predict(X_target_test_corrected)
     results["DS"] = compute_metrics(y_test, y_pred)
     results["DS"]["n_components"] = pls_ds.optimal_n_components
 
