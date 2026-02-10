@@ -19,6 +19,184 @@ from scipy import stats
 import warnings
 
 
+class CCA:
+    """Canonical Correlation Analysis for calibration transfer.
+
+    Uses regularized CCA to find a shared subspace between source and
+    target instruments, then reconstructs target spectra in source space
+    via a linear mapping learned in reduced canonical coordinates.
+
+    Reference: Feudale et al., Chemometrics Intell. Lab. Syst., 2002
+    """
+
+    def __init__(self, n_components: int = 10, regularization: float = 1e-3):
+        self.n_components = n_components
+        self.regularization = regularization
+        self.F_ = None  # Linear map: target → source (learned in PCA space)
+        self.mean_source = None
+        self.mean_target = None
+        self.V_target = None  # PCA basis for target
+        self.V_source = None  # PCA basis for source
+        self.n_comp_used = None
+
+    def fit(self, X_source: np.ndarray, X_target: np.ndarray):
+        """Fit CCA mapping between source and target instruments.
+
+        Uses PCA reduction → ridge regression for numerical stability.
+        """
+        self.mean_source = X_source.mean(axis=0)
+        self.mean_target = X_target.mean(axis=0)
+
+        Xs = X_source - self.mean_source
+        Xt = X_target - self.mean_target
+
+        N = Xs.shape[0]
+        n_comp = min(self.n_components, N - 1)
+        self.n_comp_used = n_comp
+
+        # Reduce both to PCA space (avoids ill-conditioned P×P matrices)
+        U_s, s_s, Vt_s = np.linalg.svd(Xs, full_matrices=False)
+        U_t, s_t, Vt_t = np.linalg.svd(Xt, full_matrices=False)
+
+        self.V_source = Vt_s[:n_comp].T   # (P, k)
+        self.V_target = Vt_t[:n_comp].T   # (P, k)
+
+        Zs = Xs @ self.V_source   # (N, k)
+        Zt = Xt @ self.V_target   # (N, k)
+
+        # Ridge regression: Zs ≈ Zt @ F  →  F = (Zt'Zt + λI)^{-1} Zt'Zs
+        reg = self.regularization * np.eye(n_comp)
+        self.F_ = np.linalg.solve(Zt.T @ Zt + reg, Zt.T @ Zs)
+        return self
+
+    def transform(self, X_target: np.ndarray) -> np.ndarray:
+        """Transform target spectra to source instrument space."""
+        Xt_c = X_target - self.mean_target
+        Zt = Xt_c @ self.V_target          # project to target PCA
+        Zs_hat = Zt @ self.F_              # map to source PCA scores
+        return Zs_hat @ self.V_source.T + self.mean_source  # reconstruct
+
+    def fit_transform(self, X_source_train: np.ndarray,
+                      X_target_train: np.ndarray,
+                      X_target_test: np.ndarray) -> np.ndarray:
+        """Fit on transfer samples and transform test spectra."""
+        self.fit(X_source_train, X_target_train)
+        return self.transform(X_target_test)
+
+
+class DiPLS:
+    """Domain-Invariant Partial Least Squares (di-PLS).
+
+    Adds a domain regulariser to PLS so latent scores are invariant
+    to the source/target instrument shift.  Implemented as modified
+    NIPALS with a penalty on the mean-difference direction.
+
+    Reference: Nikzad-Langerodi et al., J. Chemometrics, 2021
+    """
+
+    def __init__(self, n_components: int = 10, lambda_d: float = 1.0,
+                 max_iter: int = 200, tol: float = 1e-8):
+        self.n_components = n_components
+        self.lambda_d = lambda_d
+        self.max_iter = max_iter
+        self.tol = tol
+        self.B_ = None       # regression coefficients in original space
+        self.mean_X = None
+        self.mean_y = None
+
+    def fit(self, X_source: np.ndarray, y_source: np.ndarray,
+            X_target: np.ndarray):
+        """Fit di-PLS model.
+
+        Args:
+            X_source: (N_s, P) source spectra with labels
+            y_source: (N_s,) property values
+            X_target: (N_t, P) unlabeled target spectra
+        """
+        self.mean_X = X_source.mean(axis=0)
+        self.mean_y = float(y_source.mean())
+
+        Xs = X_source - self.mean_X
+        Xt = X_target - self.mean_X
+        ys = (y_source - self.mean_y).copy()
+
+        N_s, P = Xs.shape
+        n_comp = min(self.n_components, N_s - 1, P)
+
+        # Domain-difference direction (unit vector)
+        d = Xs.mean(axis=0) - Xt.mean(axis=0)          # (P,)
+        d_norm = np.linalg.norm(d)
+        if d_norm > 1e-12:
+            d = d / d_norm
+
+        W = np.zeros((P, n_comp))
+        P_mat = np.zeros((P, n_comp))
+        Q = np.zeros(n_comp)
+
+        X_res = Xs.copy()
+        y_res = ys.copy()
+
+        for a in range(n_comp):
+            # Standard PLS1 weight initialisation
+            w = X_res.T @ y_res                        # (P,)
+            w_norm = np.linalg.norm(w)
+            if w_norm < 1e-12:
+                n_comp = a
+                break
+            w = w / w_norm
+
+            # Iterative deflation of domain component
+            for _ in range(self.max_iter):
+                w_old = w.copy()
+                # Standard covariance direction
+                cov = X_res.T @ y_res                  # (P,)
+                # Subtract projection onto domain-diff direction
+                cov = cov - self.lambda_d * d_norm * (d @ cov) * d
+                n = np.linalg.norm(cov)
+                if n < 1e-12:
+                    break
+                w = cov / n
+                if np.linalg.norm(w - w_old) < self.tol:
+                    break
+
+            # NIPALS deflation
+            t = X_res @ w                               # (N_s,)
+            tt = t @ t
+            if tt < 1e-12:
+                n_comp = a
+                break
+            p = X_res.T @ t / tt                        # (P,)
+            q = float(y_res @ t / tt)                   # scalar
+
+            X_res = X_res - np.outer(t, p)
+            y_res = y_res - t * q
+
+            W[:, a] = w
+            P_mat[:, a] = p
+            Q[a] = q
+
+        W = W[:, :n_comp]
+        P_mat = P_mat[:, :n_comp]
+        Q = Q[:n_comp]
+
+        # Build overall B so prediction is just X_centered @ B + mean_y
+        # Standard PLS coefficient: B = W (P'W)^{-1} Q
+        R = W @ np.linalg.inv(P_mat.T @ W + 1e-10 * np.eye(n_comp))
+        self.B_ = R @ Q                                # (P,)
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict property values."""
+        return (X - self.mean_X) @ self.B_ + self.mean_y
+
+    def fit_predict(self, X_source_train: np.ndarray, y_train: np.ndarray,
+                    X_target_train: np.ndarray,
+                    X_target_test: np.ndarray) -> np.ndarray:
+        """Fit on source+target training data, predict on target test."""
+        self.fit(X_source_train, y_train, X_target_train)
+        return self.predict(X_target_test)
+
+
 class PLSCalibration:
     """PLS regression calibration model.
 
@@ -314,6 +492,36 @@ def run_baseline_comparison(
     y_pred = pls_ds.predict(X_target_test_corrected)
     results["DS"] = compute_metrics(y_test, y_pred)
     results["DS"]["n_components"] = pls_ds.optimal_n_components
+
+    # 6. CCA + PLS
+    try:
+        cca = CCA(n_components=min(10, len(y_train) - 1))
+        X_target_test_corrected = cca.fit_transform(
+            X_source_train, X_target_train, X_target_test
+        )
+        pls_cca = PLSCalibration(n_components=pls_components)
+        pls_cca.fit(X_source_train, y_train)
+        y_pred = pls_cca.predict(X_target_test_corrected)
+        results["CCA"] = compute_metrics(y_test, y_pred)
+        results["CCA"]["n_components"] = pls_cca.optimal_n_components
+    except Exception as e:
+        warnings.warn(f"CCA failed: {e}")
+        results["CCA"] = {"r2": float('nan'), "rmsep": float('nan'),
+                          "rpd": float('nan'), "bias": float('nan'),
+                          "slope": float('nan'), "error": str(e)}
+
+    # 7. di-PLS (domain-invariant PLS)
+    try:
+        dipls = DiPLS(n_components=min(10, len(y_train) - 1), lambda_d=1.0)
+        y_pred = dipls.fit_predict(
+            X_source_train, y_train, X_target_train, X_target_test
+        )
+        results["di-PLS"] = compute_metrics(y_test, y_pred)
+    except Exception as e:
+        warnings.warn(f"di-PLS failed: {e}")
+        results["di-PLS"] = {"r2": float('nan'), "rmsep": float('nan'),
+                              "rpd": float('nan'), "bias": float('nan'),
+                              "slope": float('nan'), "error": str(e)}
 
     return results
 

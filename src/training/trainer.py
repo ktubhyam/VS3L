@@ -13,7 +13,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import numpy as np
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 import time
 import json
 
@@ -23,6 +23,21 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.spectral_fm import SpectralFM, SpectralFMForPretraining
 from losses.losses import SpectralFMPretrainLoss, OTAlignmentLoss, CalibrationTransferLoss
 from config import SpectralFMConfig
+from utils.logging import ExperimentLogger
+
+
+def _config_to_dict(config) -> dict:
+    """Convert dataclass config to flat dict for logging."""
+    from dataclasses import fields, is_dataclass
+    result = {}
+    for f in fields(config):
+        val = getattr(config, f.name)
+        if is_dataclass(val):
+            for sf in fields(val):
+                result[f"{f.name}.{sf.name}"] = getattr(val, sf.name)
+        else:
+            result[f.name] = val
+    return {k: v for k, v in result.items() if isinstance(v, (int, float, str, bool))}
 
 
 class PretrainTrainer:
@@ -31,7 +46,10 @@ class PretrainTrainer:
     def __init__(self, model: SpectralFMForPretraining,
                  config: SpectralFMConfig,
                  train_loader: DataLoader,
-                 val_loader: Optional[DataLoader] = None):
+                 val_loader: Optional[DataLoader] = None,
+                 use_wandb: bool = True,
+                 run_name: Optional[str] = None,
+                 wandb_entity: Optional[str] = None):
         self.model = model
         self.config = config
         self.train_loader = train_loader
@@ -63,6 +81,10 @@ class PretrainTrainer:
             milestones=[config.pretrain.warmup_steps],
         )
 
+        # Mixed precision
+        self.use_amp = torch.cuda.is_available()
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+
         # Move to device
         self.model.to(self.device)
         self.criterion.to(self.device)
@@ -72,8 +94,19 @@ class PretrainTrainer:
         self.best_val_loss = float('inf')
         self.history = []
 
+        # Experiment logger (W&B + JSON dual backend)
+        self.exp_logger = ExperimentLogger(
+            project="SpectralFM",
+            run_name=run_name or f"pretrain_{int(time.time())}",
+            config=_config_to_dict(config),
+            log_dir=config.log_dir,
+            use_wandb=use_wandb,
+            wandb_entity=wandb_entity,
+            tags=["pretraining"],
+        )
+
     def train_step(self, batch: Dict) -> Dict[str, float]:
-        """Single training step."""
+        """Single training step with mixed precision."""
         self.model.train()
 
         spectrum = batch["spectrum"].to(self.device)
@@ -84,32 +117,33 @@ class PretrainTrainer:
         if isinstance(domain, list):
             domain = domain[0]  # Take first (all same in batch typically)
 
-        # Forward
-        output = self.model(spectrum, domain, instrument_id)
+        # Forward with AMP
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            output = self.model(spectrum, domain, instrument_id)
+            losses = self.criterion(output, instrument_id)
 
-        # Compute losses
-        losses = self.criterion(output, instrument_id)
+            # OT alignment (group by instrument)
+            if instrument_id is not None and len(instrument_id.unique()) > 1:
+                z_by_inst = {}
+                for inst_id in instrument_id.unique():
+                    mask = instrument_id == inst_id
+                    z_by_inst[inst_id.item()] = output["z_chem"][mask]
+                ot_loss = self.config.pretrain.ot_weight * self.ot_loss(z_by_inst)
+                losses["ot"] = ot_loss
+                losses["total"] = losses["total"] + ot_loss
 
-        # OT alignment (group by instrument)
-        if instrument_id is not None and len(instrument_id.unique()) > 1:
-            z_by_inst = {}
-            for inst_id in instrument_id.unique():
-                mask = instrument_id == inst_id
-                z_by_inst[inst_id.item()] = output["z_chem"][mask]
-            ot_loss = self.config.pretrain.ot_weight * self.ot_loss(z_by_inst)
-            losses["ot"] = ot_loss
-            losses["total"] = losses["total"] + ot_loss
-
-        # Backward
+        # Backward with gradient scaling
         self.optimizer.zero_grad()
-        losses["total"].backward()
+        self.scaler.scale(losses["total"]).backward()
 
-        # Gradient clipping
+        # Unscale before clipping
+        self.scaler.unscale_(self.optimizer)
         nn.utils.clip_grad_norm_(
             self.model.parameters(), self.config.pretrain.grad_clip
         )
 
-        self.optimizer.step()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
         self.scheduler.step()
 
         self.step += 1
@@ -135,8 +169,9 @@ class PretrainTrainer:
             if isinstance(domain, list):
                 domain = domain[0]
 
-            output = self.model(spectrum, domain, instrument_id)
-            losses = self.criterion(output, instrument_id)
+            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                output = self.model(spectrum, domain, instrument_id)
+                losses = self.criterion(output, instrument_id)
 
             for k, v in losses.items():
                 total_losses[k] = total_losses.get(k, 0.0) + v.item()
@@ -165,19 +200,40 @@ class PretrainTrainer:
                 if self.step % log_every == 0:
                     elapsed = time.time() - start_time
                     lr = self.scheduler.get_last_lr()[0]
+                    samples_per_sec = self.step * self.config.pretrain.batch_size / max(elapsed, 1)
+                    steps_per_sec = self.step / max(elapsed, 1)
+                    eta_sec = (max_steps - self.step) / max(steps_per_sec, 1e-8)
+                    gpu_mem_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+
                     log_msg = (
                         f"Step {self.step}/{max_steps} | "
                         f"Loss: {losses['total']:.4f} | "
                         f"MSRP: {losses.get('msrp', 0):.4f} | "
                         f"Physics: {losses.get('physics', 0):.4f} | "
                         f"VIB: {losses.get('vib', 0):.4f} | "
-                        f"MoE: {losses.get('moe_balance', 0):.4f} | "
-                        f"OT: {losses.get('ot', 0):.4f} | "
                         f"LR: {lr:.2e} | "
-                        f"Time: {elapsed:.0f}s"
+                        f"{samples_per_sec:.0f} samp/s | "
+                        f"ETA: {eta_sec/60:.1f}m | "
+                        f"GPU: {gpu_mem_gb:.1f}GB"
                     )
                     print(log_msg)
                     self.history.append({"step": self.step, **losses})
+
+                    # Log to W&B + JSON
+                    self.exp_logger.log({
+                        "train/loss": losses["total"],
+                        "train/msrp": losses.get("msrp", 0),
+                        "train/physics": losses.get("physics", 0),
+                        "train/vib": losses.get("vib", 0),
+                        "train/moe_balance": losses.get("moe_balance", 0),
+                        "train/ot": losses.get("ot", 0),
+                        "train/lr": lr,
+                        "train/elapsed_sec": elapsed,
+                        "perf/samples_per_sec": samples_per_sec,
+                        "perf/steps_per_sec": steps_per_sec,
+                        "perf/eta_minutes": eta_sec / 60,
+                        "perf/gpu_mem_gb": gpu_mem_gb,
+                    }, step=self.step)
 
                 # Validate
                 if self.step % val_every == 0 and self.val_loader:
@@ -185,9 +241,16 @@ class PretrainTrainer:
                     val_msg = f"  Val Loss: {val_losses.get('total', 0):.4f}"
                     print(val_msg)
 
+                    # Log validation to W&B + JSON
+                    self.exp_logger.log({
+                        "val/loss": val_losses.get("total", 0),
+                        "val/msrp": val_losses.get("msrp", 0),
+                    }, step=self.step)
+
                     if val_losses.get('total', float('inf')) < self.best_val_loss:
                         self.best_val_loss = val_losses['total']
                         self.save_checkpoint(save_dir / "best_pretrain.pt")
+                        self.exp_logger.log_summary({"best_val_loss": self.best_val_loss, "best_step": self.step})
                         print("  → New best model saved!")
 
                 # Save
@@ -196,6 +259,7 @@ class PretrainTrainer:
 
         # Final save
         self.save_checkpoint(save_dir / "pretrain_final.pt")
+        self.exp_logger.finish()
         print(f"Pretraining complete in {time.time() - start_time:.0f}s")
 
         return self.history
@@ -225,11 +289,24 @@ class PretrainTrainer:
 class FinetuneTrainer:
     """Fine-tuning for calibration transfer with LoRA."""
 
-    def __init__(self, model: SpectralFM, config: SpectralFMConfig):
+    def __init__(self, model: SpectralFM, config: SpectralFMConfig,
+                 use_wandb: bool = True, run_name: Optional[str] = None,
+                 wandb_entity: Optional[str] = None):
         self.model = model
         self.config = config
         self.device = config.device
         self.criterion = CalibrationTransferLoss()
+
+        # Experiment logger
+        self.exp_logger = ExperimentLogger(
+            project="SpectralFM",
+            run_name=run_name or f"finetune_{int(time.time())}",
+            config=_config_to_dict(config),
+            log_dir=config.log_dir,
+            use_wandb=use_wandb,
+            wandb_entity=wandb_entity,
+            tags=["finetuning"],
+        )
 
     def finetune(self, train_loader: DataLoader,
                  val_loader: Optional[DataLoader] = None,
@@ -318,9 +395,17 @@ class FinetuneTrainer:
                 "val_loss": val_loss,
             })
 
+            # Log to W&B + JSON
+            self.exp_logger.log({
+                "train/loss": train_loss,
+                "val/loss": val_loss,
+            }, step=epoch)
+
             if epoch % 10 == 0:
                 print(f"Epoch {epoch}/{n_epochs} | Train: {train_loss:.6f} | Val: {val_loss:.6f}")
 
+        self.exp_logger.log_summary({"best_val_loss": best_val_loss})
+        self.exp_logger.finish()
         self.model.unfreeze_all()
         return {"history": history, "best_val_loss": best_val_loss}
 

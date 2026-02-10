@@ -297,6 +297,178 @@ class CalibrationTransferDataset(Dataset):
         }
 
 
+class PretrainHDF5Dataset(Dataset):
+    """Dataset for pretraining from HDF5 corpus.
+
+    Supports both v1 and v2 corpus formats:
+      v1: /spectra, /modality (int8), /source_id (int16)
+      v2: /spectra, /metadata/source (str), /metadata/type (str), /metadata/sample_id (str)
+
+    If modality/source_id are not present, falls back to metadata/type and metadata/source.
+    """
+
+    MODALITY_NAMES = ["IR", "RAMAN", "NIR", "FTIR", "UNKNOWN"]
+    TYPE_TO_MODALITY = {"ir": 0, "raman": 1, "nir": 2, "ftir": 3}
+
+    def __init__(self, h5_path: str = "data/pretrain/spectral_corpus_v2.h5",
+                 augment: bool = True,
+                 augmentor: SpectralAugmentor = None,
+                 max_samples: int = None,
+                 default_domain: str = "RAMAN",
+                 filter_sources: Optional[List[str]] = None,
+                 filter_types: Optional[List[str]] = None):
+        """
+        Args:
+            h5_path: Path to HDF5 corpus file
+            augment: Whether to apply augmentation
+            augmentor: Custom augmentor (or uses default)
+            max_samples: Limit number of samples (for debugging)
+            default_domain: Default domain if not in HDF5
+            filter_sources: Only include spectra from these sources (e.g. ["rruff", "chembl"])
+            filter_types: Only include spectra of these types (e.g. ["raman", "ir"])
+        """
+        import h5py
+        import logging
+        log = logging.getLogger(__name__)
+
+        self.h5_path = h5_path
+        self.augment = augment
+        self.augmentor = augmentor or SpectralAugmentor()
+        self.default_domain = default_domain
+
+        # Load dataset metadata (keep file closed for multiprocessing)
+        with h5py.File(h5_path, 'r') as f:
+            total_samples = f['spectra'].shape[0]
+            self.n_channels = f['spectra'].shape[1]
+
+            # Detect format version
+            self.has_modality = 'modality' in f
+            self.has_source_id = 'source_id' in f
+            self.has_metadata = 'metadata' in f
+
+            # Build index filter if needed
+            self._indices = None
+            if (filter_sources or filter_types) and self.has_metadata:
+                sources = f['metadata/source'][:]
+                types = f['metadata/type'][:]
+
+                mask = np.ones(total_samples, dtype=bool)
+
+                if filter_sources:
+                    src_set = set(s.encode() if isinstance(s, str) else s
+                                  for s in filter_sources)
+                    # Also include augmented versions
+                    src_set_aug = set(s + b"_aug" if isinstance(s, bytes)
+                                      else (s + "_aug").encode()
+                                      for s in filter_sources)
+                    src_set = src_set | src_set_aug
+                    mask &= np.array([s in src_set for s in sources])
+
+                if filter_types:
+                    type_set = set(t.encode() if isinstance(t, str) else t
+                                   for t in filter_types)
+                    mask &= np.array([t in type_set for t in types])
+
+                self._indices = np.where(mask)[0]
+
+            # Compute effective size
+            if self._indices is not None:
+                self.n_samples = len(self._indices)
+            else:
+                self.n_samples = total_samples
+
+            if max_samples is not None:
+                self.n_samples = min(self.n_samples, max_samples)
+
+            # Log corpus stats
+            if self.has_metadata:
+                sources = f['metadata/source'][:]
+                types = f['metadata/type'][:]
+                from collections import Counter
+                src_counts = Counter(
+                    s.decode() if isinstance(s, bytes) else s for s in sources
+                )
+                type_counts = Counter(
+                    t.decode() if isinstance(t, bytes) else t for t in types
+                )
+                log.info(f"Corpus: {total_samples:,} spectra, {self.n_channels} channels")
+                log.info(f"Sources: {dict(src_counts)}")
+                log.info(f"Types: {dict(type_counts)}")
+                if self._indices is not None:
+                    log.info(f"After filtering: {self.n_samples:,} spectra")
+
+        # Will be opened lazily in worker process
+        self._h5_file = None
+
+    def __getstate__(self):
+        """For pickling (multiprocessing): don't pickle the h5 handle."""
+        state = self.__dict__.copy()
+        state['_h5_file'] = None
+        return state
+
+    def __setstate__(self, state):
+        """For unpickling: restore without h5 handle (will lazy-open)."""
+        self.__dict__.update(state)
+
+    def _get_h5(self):
+        """Lazy open HDF5 file (for multiprocessing compatibility)."""
+        import h5py
+        if self._h5_file is None:
+            self._h5_file = h5py.File(self.h5_path, 'r')
+        return self._h5_file
+
+    def _real_idx(self, idx):
+        """Map filtered index to actual HDF5 index."""
+        if self._indices is not None:
+            return int(self._indices[idx])
+        return idx
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        h5 = self._get_h5()
+        real_idx = self._real_idx(idx)
+
+        spectrum = h5['spectra'][real_idx].astype(np.float32)
+
+        # Get modality/domain
+        if self.has_modality:
+            modality = int(h5['modality'][real_idx])
+            domain = self.MODALITY_NAMES[min(modality, len(self.MODALITY_NAMES) - 1)]
+        elif self.has_metadata and 'type' in h5['metadata']:
+            spec_type = h5['metadata/type'][real_idx]
+            if isinstance(spec_type, bytes):
+                spec_type = spec_type.decode()
+            modality = self.TYPE_TO_MODALITY.get(spec_type.lower(), 4)
+            domain = spec_type.upper()
+        else:
+            modality = self.MODALITY_NAMES.index(self.default_domain) if self.default_domain in self.MODALITY_NAMES else 4
+            domain = self.default_domain
+
+        # Get source_id
+        if self.has_source_id:
+            source_id = int(h5['source_id'][real_idx])
+        else:
+            source_id = 0
+
+        # Augment if enabled
+        if self.augment:
+            spectrum = self.augmentor.augment(spectrum, p=0.5)
+
+        return {
+            "spectrum": torch.tensor(spectrum, dtype=torch.float32),
+            "modality": torch.tensor(modality, dtype=torch.long),
+            "source_id": torch.tensor(source_id, dtype=torch.long),
+            "instrument_id": torch.tensor(source_id, dtype=torch.long),
+            "domain": domain,
+        }
+
+    def __del__(self):
+        if self._h5_file is not None:
+            self._h5_file.close()
+
+
 def build_pretrain_loader(data_dir: str, batch_size: int = 64,
                           target_length: int = 2048,
                           num_workers: int = 2) -> DataLoader:
@@ -320,6 +492,29 @@ def build_pretrain_loader(data_dir: str, batch_size: int = 64,
 
     return DataLoader(
         combined,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+
+def build_hdf5_pretrain_loader(h5_path: str, batch_size: int = 64,
+                                num_workers: int = 0,
+                                max_samples: int = None) -> DataLoader:
+    """Build pretraining dataloader from HDF5 corpus.
+
+    Args:
+        h5_path: Path to HDF5 corpus file
+        batch_size: Batch size
+        num_workers: Number of data loading workers (0 for main process)
+        max_samples: Limit number of samples (for debugging)
+    """
+    dataset = PretrainHDF5Dataset(h5_path, augment=True, max_samples=max_samples)
+
+    return DataLoader(
+        dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,

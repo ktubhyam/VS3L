@@ -210,9 +210,9 @@ class SpectralFMConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Paths
-    data_dir: str = "/home/claude/SpectralFM/data"
-    checkpoint_dir: str = "/home/claude/SpectralFM/checkpoints"
-    log_dir: str = "/home/claude/SpectralFM/logs"
+    data_dir: str = "data"
+    checkpoint_dir: str = "checkpoints"
+    log_dir: str = "logs"
 
     @property
     def d_model(self) -> int:

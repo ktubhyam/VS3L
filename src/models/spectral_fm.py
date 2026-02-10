@@ -339,7 +339,7 @@ class SpectralFM(nn.Module):
                 if "lora" in n.lower()]
 
     def freeze_backbone(self):
-        """Freeze everything except task heads for fine-tuning."""
+        """Freeze everything except task heads and LoRA adapters."""
         for param in self.parameters():
             param.requires_grad = False
         # Unfreeze heads
@@ -347,6 +347,10 @@ class SpectralFM(nn.Module):
             param.requires_grad = True
         for param in self.fno_head.parameters():
             param.requires_grad = True
+        # Unfreeze LoRA params (if injected)
+        for name, param in self.named_parameters():
+            if 'lora_' in name:
+                param.requires_grad = True
 
     def unfreeze_all(self):
         """Unfreeze all parameters."""

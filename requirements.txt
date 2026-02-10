@@ -36,8 +36,8 @@ pyyaml>=6.0
 # mamba-ssm>=1.2.0  # CUDA Mamba kernels (Linux + CUDA only)
 # neuraloperator>=0.3.0  # Reference FNO implementation
 
-# Optional — Experiment Tracking
-# wandb>=0.15.0
+# Experiment Tracking
+wandb>=0.15.0
 
 # Optional — Uncertainty Quantification
 # mapie>=0.8.0  # Conformal prediction

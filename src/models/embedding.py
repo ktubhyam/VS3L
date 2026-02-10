@@ -68,13 +68,15 @@ class WaveletEmbedding(nn.Module):
 
     def __init__(self, d_model: int = 256, n_channels: int = 2048,
                  wavelet_levels: int = 4, patch_size: int = 32,
-                 stride: int = 16, dropout: float = 0.1):
+                 stride: int = 16, dropout: float = 0.1,
+                 wavelet_name: str = "db4"):
         super().__init__()
         self.d_model = d_model
         self.n_channels = n_channels
         self.wavelet_levels = wavelet_levels
         self.patch_size = patch_size
         self.stride = stride
+        self.wavelet_name = wavelet_name
 
         # Compute number of patches at each scale
         # DWT halves the length at each level
@@ -117,31 +119,40 @@ class WaveletEmbedding(nn.Module):
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
     def _wavelet_decompose_batch(self, x: torch.Tensor) -> dict:
-        """Approximate DWT using learnable 1D convolutions.
+        """DWT decomposition using pywt (db4, configurable levels).
 
-        For actual deployment we'd use pywt, but for differentiability
-        we use conv-based approximation during training.
+        Uses actual Daubechies-4 wavelet via PyWavelets for proper
+        multi-scale decomposition. Not differentiable, but the model
+        learns FROM the coefficients, not THROUGH the decomposition.
+
+        pywt output lengths for 2048 input with db4, 4 levels:
+            cA4: 134, cD4: 134, cD3: 262, cD2: 517, cD1: 1027
+        These differ from Haar (which always halves), but downstream
+        F.interpolate(..., size=N) handles the size mismatch.
         """
-        # Simple approach: use average pooling for approximation,
-        # difference for detail (Haar-like wavelet approximation)
-        coeffs = {"approx": [], "details": []}
-        current = x  # (B, L)
+        import pywt
 
-        for level in range(self.wavelet_levels):
-            # Pad if odd length
-            if current.size(-1) % 2 == 1:
-                current = F.pad(current, (0, 1), mode='reflect')
+        device = x.device
+        x_np = x.detach().cpu().numpy()
 
-            # Approximation (low-pass): average of pairs
-            approx = (current[:, ::2] + current[:, 1::2]) / 2.0
-            # Detail (high-pass): difference of pairs
-            detail = (current[:, ::2] - current[:, 1::2]) / 2.0
+        all_approx = []
+        all_details = [[] for _ in range(self.wavelet_levels)]
 
-            coeffs["details"].append(detail)
-            current = approx
+        for i in range(x_np.shape[0]):
+            coeffs = pywt.wavedec(x_np[i], self.wavelet_name, level=self.wavelet_levels)
+            # coeffs = [cA_L, cD_L, cD_{L-1}, ..., cD_1]  (pywt convention)
+            all_approx.append(coeffs[0])
+            for level in range(self.wavelet_levels):
+                all_details[level].append(coeffs[level + 1])
 
-        coeffs["approx"] = current
-        return coeffs
+        result = {
+            "approx": torch.tensor(np.stack(all_approx), dtype=torch.float32, device=device),
+            "details": [
+                torch.tensor(np.stack(d), dtype=torch.float32, device=device)
+                for d in all_details
+            ],
+        }
+        return result
 
     def forward(self, spectrum: torch.Tensor,
                 domain: Optional[str] = None,

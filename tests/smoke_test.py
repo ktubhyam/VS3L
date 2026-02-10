@@ -221,13 +221,90 @@ def test_ttt():
     import torch
     from src.config import SpectralFMConfig
     from src.models.spectral_fm import SpectralFM
-    
+
     cfg = SpectralFMConfig()
     model = SpectralFM(cfg)
-    
+
     test_spectra = torch.randn(10, 2048)
     model.test_time_train(test_spectra, n_steps=2, lr=1e-4)
     print("    TTT completed without error")
+
+
+def test_wavelet_pywt():
+    """Test that wavelet embedding uses pywt and produces correct shapes."""
+    import torch
+    from src.models.embedding import WaveletEmbedding
+
+    emb = WaveletEmbedding(d_model=64, n_channels=2048, wavelet_levels=4,
+                           patch_size=32, stride=16)
+    x = torch.randn(2, 2048)
+    tokens = emb(x)
+    expected_n_patches = (2048 - 32) // 16 + 1  # 127
+    expected_shape = (2, expected_n_patches + 2, 64)  # +2 for CLS + domain
+    assert tokens.shape == expected_shape, f"Wrong shape: {tokens.shape}, expected {expected_shape}"
+    assert torch.isfinite(tokens).all()
+    print(f"    pywt wavelet output: {tokens.shape}")
+
+
+def test_lora_injection():
+    """Test LoRA injection and forward pass."""
+    import torch
+    from src.config import get_light_config
+    from src.models.spectral_fm import SpectralFM
+    from src.models.lora import inject_lora, get_lora_state_dict
+
+    config = get_light_config()
+    model = SpectralFM(config)
+    total_before = sum(p.numel() for p in model.parameters())
+
+    inject_lora(model, ["q_proj", "k_proj", "v_proj"], rank=4, alpha=8)
+
+    total_after = sum(p.numel() for p in model.parameters())
+    lora_params = sum(p.numel() for n, p in model.named_parameters() if 'lora_' in n)
+    assert lora_params > 0, "No LoRA params found!"
+    print(f"    LoRA params: {lora_params:,} (added {total_after - total_before:,})")
+
+    # Forward still works
+    x = torch.randn(2, 2048)
+    model.eval()
+    with torch.no_grad():
+        out = model.encode(x)
+    assert out["z_chem"].shape == (2, config.vib.z_chem_dim)
+
+    # Freeze + LoRA stays trainable
+    model.freeze_backbone()
+    lora_trainable = sum(p.numel() for n, p in model.named_parameters()
+                         if p.requires_grad and 'lora_' in n)
+    assert lora_trainable > 0, "No LoRA params trainable after freeze"
+
+    # State dict extraction
+    lora_sd = get_lora_state_dict(model)
+    assert len(lora_sd) > 0
+    print(f"    LoRA state dict: {len(lora_sd)} keys")
+
+
+def test_logger():
+    """Test dual logging (JSON-only mode)."""
+    import tempfile, json
+    from src.utils.logging import ExperimentLogger
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        exp_logger = ExperimentLogger(
+            project="test", run_name="smoke",
+            use_wandb=False, log_dir=tmpdir
+        )
+        exp_logger.log({"loss": 1.0}, step=0)
+        exp_logger.log({"loss": 0.5}, step=1)
+        exp_logger.finish()
+
+        log_file = f"{tmpdir}/smoke.jsonl"
+        with open(log_file) as f:
+            lines = f.readlines()
+        assert len(lines) == 2, f"Expected 2 log lines, got {len(lines)}"
+        entry = json.loads(lines[0])
+        assert "loss" in entry
+        assert "_step" in entry
+    print("    JSON logging OK")
 
 
 if __name__ == "__main__":
@@ -264,7 +341,12 @@ if __name__ == "__main__":
     
     print("\n--- 7. Test-Time Training ---")
     test("ttt", test_ttt)
-    
+
+    print("\n--- 8. P2: Architecture Fixes ---")
+    test("wavelet_pywt", test_wavelet_pywt)
+    test("lora_injection", test_lora_injection)
+    test("logger", test_logger)
+
     print("\n" + "=" * 60)
     print("RESULTS SUMMARY")
     print("=" * 60)
