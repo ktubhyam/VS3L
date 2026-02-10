@@ -189,8 +189,8 @@ class MixtureOfExperts(nn.Module):
         top_k_logits, top_k_indices = logits.topk(self.top_k, dim=-1)
         top_k_gates = F.softmax(top_k_logits, dim=-1)
 
-        # Create sparse gate tensor
-        gates = torch.zeros_like(logits)
+        # Create sparse gate tensor (match softmax output dtype for AMP compatibility)
+        gates = torch.zeros_like(logits, dtype=top_k_gates.dtype)
         gates.scatter_(1, top_k_indices, top_k_gates)
 
         return gates, top_k_indices
