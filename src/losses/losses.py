@@ -324,12 +324,11 @@ class VIBLoss(nn.Module):
         ) * self.disentangle_weight
 
         # z_chem should NOT predict instrument (adversarial)
-        # Maximize entropy of instrument prediction from z_chem
+        # Minimize KL(uniform || pred) → push pred toward uniform → max entropy
         inst_pred_from_chem = F.softmax(vib_out["inst_from_chem"], dim=-1)
-        # Uniform distribution = max entropy
         n_inst = vib_out["inst_from_chem"].size(-1)
         uniform = torch.ones_like(inst_pred_from_chem) / n_inst
-        losses["chem_adversarial"] = -F.kl_div(
+        losses["chem_adversarial"] = F.kl_div(
             inst_pred_from_chem.log(), uniform, reduction='batchmean'
         ) * self.disentangle_weight
 
