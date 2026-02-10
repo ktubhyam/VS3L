@@ -1,14 +1,12 @@
-# SpectralFM
+# SSM-OT-CalTransfer
 
-**The first self-supervised foundation model for vibrational spectroscopy.**
+**Bridging State Space Models and Optimal Transport for Zero-to-Few-Shot Spectral Calibration Transfer**
 
-Hybrid Mamba-Transformer architecture with optimal transport for zero-to-few-shot calibration transfer across instruments and modalities.
+The first self-supervised foundation model for vibrational spectroscopy (NIR, IR, Raman). Combines a hybrid Mamba-Transformer backbone with Sinkhorn-based optimal transport domain adaptation, variational information bottleneck disentanglement, and physics-informed regularization to achieve calibration transfer across spectrometers using 10 or fewer labeled samples.
 
-> **Paper:** "Bridging State Space Models and Optimal Transport for Zero-to-Few-Shot Spectral Calibration Transfer"
->
 > **Author:** Tubhyam Karthikeyan (ICT Mumbai / InvyrAI)
 >
-> **Target:** Analytical Chemistry (ACS, IF 7.4)
+> **Target Journal:** Analytical Chemistry (ACS, IF 7.4)
 
 ---
 
@@ -18,11 +16,11 @@ Calibration transfer in spectroscopy has relied on the same approaches for 30+ y
 
 ## Our Approach
 
-SpectralFM proposes a **fifth strategy** for calibration transfer: learn instrument-invariant chemical representations from a massive pretraining corpus, then adapt with minimal transfer data.
+SSM-OT-CalTransfer proposes a **fifth strategy** for calibration transfer: learn instrument-invariant chemical representations from a massive pretraining corpus, then adapt with minimal transfer data.
 
 - **Zero-shot:** Test-time training (TTT) on unlabeled spectra from the new instrument
 - **Few-shot:** LoRA fine-tuning with as few as 5-10 transfer samples
-- **Target:** SpectralFM@10 samples beats classical methods@50 samples
+- **Target:** 10 transfer samples beats classical methods using 50
 
 ## Architecture
 
@@ -47,7 +45,7 @@ Spectrum (B, 2048)
 ## Project Structure
 
 ```
-SpectralFM/
+SSM-OT-CalTransfer/
 ├── run.py                         # Entry point (pretrain / finetune / evaluate / ttt)
 ├── src/
 │   ├── config.py                  # All hyperparameters (dataclass-based)
@@ -110,8 +108,8 @@ SpectralFM/
 
 ```bash
 # Clone
-git clone https://github.com/ktubhyam/SpectralFM.git
-cd SpectralFM
+git clone https://github.com/ktubhyam/SSM-OT-CalTransfer.git
+cd SSM-OT-CalTransfer
 
 # Install dependencies
 pip install -r requirements.txt
@@ -154,7 +152,7 @@ python run.py --mode ttt --checkpoint checkpoints/pretrain_best.pt
 | DS | Classical | Direct Standardization |
 | SBC | Classical | Slope/Bias Correction |
 | PLS | Classical | Partial Least Squares regression |
-| SpectralFM (ours) | Foundation model | Few-shot LoRA transfer + TTT |
+| SSM-OT-CalTransfer (ours) | Foundation model | Few-shot LoRA transfer + TTT |
 
 ## Key Benchmark Target
 
@@ -163,11 +161,11 @@ python run.py --mode ttt --checkpoint checkpoints/pretrain_best.pt
 | PDS | ~0.55 | 30 |
 | DS | ~0.69 | 30 |
 | LoRA-CT (literature) | 0.952 | 50 |
-| **SpectralFM (target)** | **>0.96** | **10** |
+| **SSM-OT-CalTransfer (target)** | **>0.96** | **10** |
 
 ## Current Status
 
-**Phase 1 (Make It Run):** Code written (~12K lines), data preprocessed, baselines running. Forward pass and training loop under active debugging.
+**Phase 1 (Make It Run):** Core architecture implemented (~12K lines across 20 Python modules), evaluation datasets preprocessed (Corn: 80 samples x 3 instruments, Tablet: 655 samples x 2 instruments), classical baselines running (PDS, DS, SBC). Forward pass and training loop under active debugging.
 
 See [PROJECT_STATUS.md](PROJECT_STATUS.md) and [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for detailed progress tracking.
 
@@ -193,7 +191,7 @@ MIT License. See [LICENSE](LICENSE).
 ## Citation
 
 ```bibtex
-@article{karthikeyan2026spectralfm,
+@article{karthikeyan2026ssmotcaltransfer,
   title={Bridging State Space Models and Optimal Transport for Zero-to-Few-Shot Spectral Calibration Transfer},
   author={Karthikeyan, Tubhyam},
   journal={Analytical Chemistry},
@@ -203,4 +201,4 @@ MIT License. See [LICENSE](LICENSE).
 
 ---
 
-*SpectralFM is under active development. This is a research project targeting publication.*
+*Under active development. This is a research project targeting publication in Analytical Chemistry (ACS).*
