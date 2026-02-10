@@ -89,6 +89,12 @@ class PretrainTrainer:
         self.model.to(self.device)
         self.criterion.to(self.device)
 
+        # Multi-GPU via DataParallel
+        self.n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if self.n_gpus > 1:
+            self.model = nn.DataParallel(self.model)
+            print(f"Using DataParallel on {self.n_gpus} GPUs")
+
         # Logging
         self.step = 0
         self.best_val_loss = float('inf')
@@ -105,6 +111,22 @@ class PretrainTrainer:
             tags=["pretraining"],
         )
 
+    def _reduce_dp_scalars(self, output: Dict) -> Dict:
+        """Reduce scalar tensors gathered by DataParallel.
+
+        DataParallel concatenates 0-dim scalars from each GPU into 1D tensors.
+        This reduces them back to scalars via mean.
+        """
+        if self.n_gpus <= 1:
+            return output
+        if output["moe_loss"].dim() > 0:
+            output["moe_loss"] = output["moe_loss"].mean()
+        if "vib" in output:
+            for k in ("kl_chem", "kl_inst", "kl_loss"):
+                if k in output["vib"] and output["vib"][k].dim() > 0:
+                    output["vib"][k] = output["vib"][k].mean()
+        return output
+
     def train_step(self, batch: Dict) -> Dict[str, float]:
         """Single training step with mixed precision."""
         self.model.train()
@@ -120,6 +142,7 @@ class PretrainTrainer:
         # Forward with AMP
         with torch.cuda.amp.autocast(enabled=self.use_amp):
             output = self.model(spectrum, domain, instrument_id)
+            output = self._reduce_dp_scalars(output)
             losses = self.criterion(output, instrument_id)
 
             # OT alignment (group by instrument)
@@ -171,6 +194,7 @@ class PretrainTrainer:
 
             with torch.cuda.amp.autocast(enabled=self.use_amp):
                 output = self.model(spectrum, domain, instrument_id)
+                output = self._reduce_dp_scalars(output)
                 losses = self.criterion(output, instrument_id)
 
             for k, v in losses.items():
@@ -266,9 +290,10 @@ class PretrainTrainer:
 
     def save_checkpoint(self, path: str):
         """Save model checkpoint."""
+        model_to_save = self.model.module if self.n_gpus > 1 else self.model
         torch.save({
             "step": self.step,
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": model_to_save.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "best_val_loss": self.best_val_loss,
@@ -278,7 +303,8 @@ class PretrainTrainer:
     def load_checkpoint(self, path: str):
         """Load model checkpoint."""
         ckpt = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model_state_dict"])
+        model_to_load = self.model.module if self.n_gpus > 1 else self.model
+        model_to_load.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         self.step = ckpt["step"]
